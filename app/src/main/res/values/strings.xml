@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FocusGuard</string>
+    <string name="accessibility_description">
+        FocusGuard monitors which app is in the foreground and
+        which websites you visit in browsers to enforce your
+        screen time limits. When a monitored app exceeds its
+        allowed time or a blocked website is detected,
+        FocusGuard will lock your screen automatically.
+    </string>
+</resources>
