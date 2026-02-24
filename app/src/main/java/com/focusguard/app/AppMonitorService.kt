@@ -21,7 +21,6 @@ class AppMonitorService : AccessibilityService() {
     private var monitorStartTime = 0L
     private var monitorDelay = 0L
     private var lastUrlCheckTime = 0L
-    private var lastIncognitoCheckTime = 0L
     private var pendingWebsiteBlock: Runnable? = null
     private var pendingBlockSite: String? = null
     private var websiteBlockStartTime = 0L
@@ -30,7 +29,6 @@ class AppMonitorService : AccessibilityService() {
 
     companion object {
         private const val URL_CHECK_INTERVAL = 1500L
-        private const val INCOGNITO_CHECK_INTERVAL = 2000L
         private const val WEBSITE_GRACE_PERIOD = 5_000L
         private const val MAX_TREE_DEPTH = 25
     }
@@ -120,13 +118,7 @@ class AppMonitorService : AccessibilityService() {
                 if (currentBrowserPackage != null &&
                     packageName == currentBrowserPackage
                 ) {
-                    // Event-driven website grace period check.
                     if (checkWebsiteGracePeriodElapsed()) return
-
-                    if (hasBlockedWebsites() && throttledIncognitoCheck()) {
-                        closeBrowserAndLock(currentBrowserPackage)
-                        return
-                    }
                     throttledUrlCheck()
                 }
             }
@@ -167,27 +159,26 @@ class AppMonitorService : AccessibilityService() {
             currentBrowserPackage = null
         }
 
-        // Transient overlays (systemui, our own app): skip entirely,
-        // keep timer and browser tracking alive.
         if (packageName in transientPackages) {
-            FocusGuardLog.d("Transient overlay: $packageName, keeping timer")
+            FocusGuardLog.w("Transient: $packageName, timer continues")
             return
         }
 
-        // Launcher / home screen: user left the app deliberately.
         if (packageName in launcherPackages ||
             packageName.contains("launcher", ignoreCase = true)
         ) {
-            FocusGuardLog.d("Home screen: $packageName, cancelling timer")
+            FocusGuardLog.w(
+                "Launcher: $packageName, cancelling timer" +
+                    " (was: $currentMonitoredPackage)"
+            )
             cancelTimer()
             return
         }
 
         if (!tracker.isMonitored(packageName)) {
-            // Non-monitored app (keyboard, calculator, etc.):
-            // keep the timer running so opening a monitored app
-            // can't be dodged by briefly switching elsewhere.
-            FocusGuardLog.d("Non-monitored app: $packageName, timer continues")
+            FocusGuardLog.w(
+                "Non-monitored: $packageName ($className)"
+            )
             return
         }
 
@@ -228,56 +219,14 @@ class AppMonitorService : AccessibilityService() {
     }
 
     // ─── Incognito Detection ─────────────────────────
+    // Class-name-only check. Tree scanning caused false positives
+    // because Chrome's normal UI contains "incognito" text in
+    // buttons/menus ("New Incognito Tab"). URL-based blocking
+    // still works in incognito mode, so this is sufficient.
 
     private fun isIncognitoMode(className: String): Boolean {
         val lowerClass = className.lowercase()
-        if (incognitoSignals.any { lowerClass.contains(it) }) {
-            return true
-        }
-        return checkWindowForIncognito()
-    }
-
-    private fun throttledIncognitoCheck(): Boolean {
-        val now = System.currentTimeMillis()
-        if (now - lastIncognitoCheckTime < INCOGNITO_CHECK_INTERVAL) {
-            return false
-        }
-        lastIncognitoCheckTime = now
-        return checkWindowForIncognito()
-    }
-
-    private fun checkWindowForIncognito(): Boolean {
-        val root = rootInActiveWindow ?: return false
-        return scanForIncognitoHints(root, 0)
-    }
-
-    private fun scanForIncognitoHints(
-        node: AccessibilityNodeInfo,
-        depth: Int
-    ): Boolean {
-        if (depth > MAX_TREE_DEPTH) return false
-
-        val desc = node.contentDescription?.toString()?.lowercase() ?: ""
-        val resId = node.viewIdResourceName?.lowercase() ?: ""
-
-        if (incognitoSignals.any { signal ->
-                desc.contains(signal) || resId.contains(signal)
-            }
-        ) return true
-
-        val text = node.text?.toString()?.lowercase() ?: ""
-        if (node.className?.toString()?.contains("TextView") == true &&
-            (text == "incognito" || text == "inprivate" ||
-                text.contains("private browsing") ||
-                text.contains("private tab") ||
-                text.contains("incognito mode"))
-        ) return true
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (scanForIncognitoHints(child, depth + 1)) return true
-        }
-        return false
+        return incognitoSignals.any { lowerClass.contains(it) }
     }
 
     private fun hasBlockedWebsites(): Boolean {
@@ -332,16 +281,19 @@ class AppMonitorService : AccessibilityService() {
             pendingBlockBrowserPkg = currentBrowserPackage
             websiteBlockStartTime = System.currentTimeMillis()
 
-            // Handler as backup for event-driven check above.
             val browserPkg = currentBrowserPackage
             val runnable = Runnable {
                 val currentUrl = extractUrlFromBrowser()
-                if (currentUrl != null && tracker.isMonitoredWebsite(currentUrl)) {
+                if (currentUrl != null &&
+                    tracker.isMonitoredWebsite(currentUrl)
+                ) {
                     FocusGuardLog.w("Handler website block: $matchedSite")
                     tracker.incrementWebsiteBlockCount(matchedSite)
                     closeBrowserAndLock(browserPkg)
                 } else {
-                    FocusGuardLog.d("User navigated away, cancelling block")
+                    FocusGuardLog.w(
+                        "Grace period expired, user navigated away"
+                    )
                 }
                 pendingBlockSite = null
                 pendingWebsiteBlock = null
@@ -353,9 +305,10 @@ class AppMonitorService : AccessibilityService() {
             return true
         }
 
-        if (pendingBlockSite != null) {
-            cancelPendingWebsiteBlock()
-        }
+        // Don't cancel pending blocks here — URLs can briefly
+        // change during page transitions/redirects. The grace
+        // period timer and event-driven check will handle
+        // cancellation by re-checking the URL when they fire.
         return false
     }
 
