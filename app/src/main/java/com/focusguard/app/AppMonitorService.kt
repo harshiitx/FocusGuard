@@ -7,7 +7,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -15,6 +14,7 @@ class AppMonitorService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val tracker by lazy { AppUsageTracker(this) }
+    private val overlay by lazy { CountdownOverlay(this) }
     private var lockRunnable: Runnable? = null
     private var currentMonitoredPackage: String? = null
     private var currentBrowserPackage: String? = null
@@ -29,7 +29,6 @@ class AppMonitorService : AccessibilityService() {
     private var isClosingBrowser = false
 
     companion object {
-        private const val TAG = "FocusGuard"
         private const val URL_CHECK_INTERVAL = 1500L
         private const val INCOGNITO_CHECK_INTERVAL = 2000L
         private const val WEBSITE_GRACE_PERIOD = 5_000L
@@ -103,8 +102,7 @@ class AppMonitorService : AccessibilityService() {
         if (currentMonitoredPackage != null && monitorStartTime > 0) {
             val elapsed = System.currentTimeMillis() - monitorStartTime
             if (elapsed >= monitorDelay) {
-                Log.d(
-                    TAG,
+                FocusGuardLog.w(
                     "Event-driven lock for $currentMonitoredPackage " +
                         "(${elapsed / 1000}s elapsed)"
                 )
@@ -142,14 +140,15 @@ class AppMonitorService : AccessibilityService() {
         currentMonitoredPackage = null
         monitorStartTime = 0L
         monitorDelay = 0L
+        overlay.hide()
         cancelPendingWebsiteBlock()
-        Log.d(TAG, "Locking screen for $pkg")
+        FocusGuardLog.w("Locking screen for $pkg")
         lockScreenAndGoHome()
     }
 
     private fun handleWindowChanged(packageName: String, className: String) {
         if (shouldBlockSettingsPage(packageName, className)) {
-            Log.d(TAG, "Blocking settings page: $className")
+            FocusGuardLog.w("Blocking settings page: $className")
             lockScreenAndGoHome()
             return
         }
@@ -159,7 +158,7 @@ class AppMonitorService : AccessibilityService() {
             if (!isClosingBrowser &&
                 isIncognitoMode(className) && hasBlockedWebsites()
             ) {
-                Log.d(TAG, "Incognito detected in $packageName")
+                FocusGuardLog.w("Incognito detected in $packageName")
                 closeBrowserAndLock(packageName)
                 return
             }
@@ -171,7 +170,7 @@ class AppMonitorService : AccessibilityService() {
         // Transient overlays (systemui, our own app): skip entirely,
         // keep timer and browser tracking alive.
         if (packageName in transientPackages) {
-            Log.d(TAG, "Transient overlay: $packageName, keeping timer")
+            FocusGuardLog.d("Transient overlay: $packageName, keeping timer")
             return
         }
 
@@ -179,7 +178,7 @@ class AppMonitorService : AccessibilityService() {
         if (packageName in launcherPackages ||
             packageName.contains("launcher", ignoreCase = true)
         ) {
-            Log.d(TAG, "Home screen: $packageName, cancelling timer")
+            FocusGuardLog.d("Home screen: $packageName, cancelling timer")
             cancelTimer()
             return
         }
@@ -188,7 +187,7 @@ class AppMonitorService : AccessibilityService() {
             // Non-monitored app (keyboard, calculator, etc.):
             // keep the timer running so opening a monitored app
             // can't be dodged by briefly switching elsewhere.
-            Log.d(TAG, "Non-monitored app: $packageName, timer continues")
+            FocusGuardLog.d("Non-monitored app: $packageName, timer continues")
             return
         }
 
@@ -201,18 +200,20 @@ class AppMonitorService : AccessibilityService() {
         val delay = getDelayForOpenCount(openCount)
         monitorStartTime = System.currentTimeMillis()
         monitorDelay = delay
-        Log.d(
-            TAG,
-            "Monitoring $packageName: open #$openCount, lock in ${delay / 1000}s"
+        FocusGuardLog.w(
+            "Monitoring $packageName: open #$openCount, " +
+                "lock in ${delay / 1000}s"
         )
+        overlay.show(delay)
 
         // Handler as backup — event-driven check in onAccessibilityEvent
         // is the primary enforcement in case the OS suppresses the Handler.
         val runnable = Runnable {
-            Log.d(TAG, "Handler fired for $packageName, locking screen")
+            FocusGuardLog.w("Handler fired for $packageName, locking")
             currentMonitoredPackage = null
             monitorStartTime = 0L
             monitorDelay = 0L
+            overlay.hide()
             lockScreenAndGoHome()
         }
         lockRunnable = runnable
@@ -304,8 +305,7 @@ class AppMonitorService : AccessibilityService() {
 
         val currentUrl = extractUrlFromBrowser()
         if (currentUrl != null && tracker.isMonitoredWebsite(currentUrl)) {
-            Log.d(
-                TAG,
+            FocusGuardLog.w(
                 "Event-driven website block: $site (${elapsed / 1000}s)"
             )
             tracker.incrementWebsiteBlockCount(site)
@@ -313,7 +313,7 @@ class AppMonitorService : AccessibilityService() {
             closeBrowserAndLock(browserPkg)
             return true
         } else {
-            Log.d(TAG, "User navigated away during grace period")
+            FocusGuardLog.d("User navigated away during grace period")
             cancelPendingWebsiteBlock()
         }
         return false
@@ -326,7 +326,7 @@ class AppMonitorService : AccessibilityService() {
         if (matchedSite != null) {
             if (pendingBlockSite == matchedSite) return true
 
-            Log.d(TAG, "Blocked site detected: $matchedSite (url: $url)")
+            FocusGuardLog.w("Blocked site: $matchedSite (url: $url)")
             cancelPendingWebsiteBlock()
             pendingBlockSite = matchedSite
             pendingBlockBrowserPkg = currentBrowserPackage
@@ -337,11 +337,11 @@ class AppMonitorService : AccessibilityService() {
             val runnable = Runnable {
                 val currentUrl = extractUrlFromBrowser()
                 if (currentUrl != null && tracker.isMonitoredWebsite(currentUrl)) {
-                    Log.d(TAG, "Handler website block: $matchedSite")
+                    FocusGuardLog.w("Handler website block: $matchedSite")
                     tracker.incrementWebsiteBlockCount(matchedSite)
                     closeBrowserAndLock(browserPkg)
                 } else {
-                    Log.d(TAG, "User navigated away, cancelling block")
+                    FocusGuardLog.d("User navigated away, cancelling block")
                 }
                 pendingBlockSite = null
                 pendingWebsiteBlock = null
@@ -421,6 +421,7 @@ class AppMonitorService : AccessibilityService() {
         monitorStartTime = 0L
         monitorDelay = 0L
         isClosingBrowser = false
+        overlay.hide()
         cancelPendingWebsiteBlock()
     }
 
@@ -437,7 +438,7 @@ class AppMonitorService : AccessibilityService() {
     private fun closeBrowserAndLock(browserPackage: String?) {
         if (isClosingBrowser) return
         isClosingBrowser = true
-        Log.d(TAG, "closeBrowserAndLock: $browserPackage")
+        FocusGuardLog.w("closeBrowserAndLock: $browserPackage")
 
         performGlobalAction(GLOBAL_ACTION_BACK)
 
@@ -474,6 +475,7 @@ class AppMonitorService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        overlay.hide()
         cancelTimer()
     }
 }

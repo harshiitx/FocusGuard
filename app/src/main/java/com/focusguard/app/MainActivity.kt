@@ -909,7 +909,10 @@ fun StatsScreen(modifier: Modifier = Modifier) {
             modifier = modifier.fillMaxSize(),
             contentAlignment = Alignment.Center
         ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.padding(24.dp)
+            ) {
                 Icon(
                     Icons.Outlined.DoNotDisturb,
                     contentDescription = null,
@@ -926,6 +929,19 @@ fun StatsScreen(modifier: Modifier = Modifier) {
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Spacer(Modifier.height(24.dp))
+                FilledTonalButton(
+                    onClick = { FocusGuardLog.shareLog(context) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        Icons.Filled.Info,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Share Debug Log (last 20 min)")
+                }
             }
         }
         return
@@ -1080,6 +1096,22 @@ fun StatsScreen(modifier: Modifier = Modifier) {
                 }
             }
         }
+
+        item {
+            Spacer(Modifier.height(16.dp))
+            FilledTonalButton(
+                onClick = { FocusGuardLog.shareLog(context) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(
+                    Icons.Filled.Info,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Share Debug Log (last 20 min)")
+            }
+        }
     }
 }
 
@@ -1093,9 +1125,11 @@ fun ParagraphChallengeDialog(
 ) {
     var typedText by remember { mutableStateOf("") }
     var pasteWarning by remember { mutableStateOf(false) }
-    val isMatch = typedText == paragraph
-    val progress = (typedText.length.toFloat() / paragraph.length.toFloat())
-        .coerceIn(0f, 1f)
+    val similarity = remember(typedText, paragraph) {
+        computeSimilarity(typedText, paragraph)
+    }
+    val isMatch = similarity >= 0.80f
+    val progress = similarity
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -1136,8 +1170,8 @@ fun ParagraphChallengeDialog(
                 Spacer(Modifier.height(16.dp))
 
                 Text(
-                    "Type the following paragraph exactly " +
-                        "to proceed (copy-paste is disabled):",
+                    "Type the following paragraph to proceed " +
+                        "(80% accuracy required, copy-paste disabled):",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1171,8 +1205,11 @@ fun ParagraphChallengeDialog(
                 )
 
                 Text(
-                    "${typedText.length} / ${paragraph.length} characters",
+                    "${(similarity * 100).toInt()}% match" +
+                        if (isMatch) " \u2713" else " (need 80%)",
                     style = MaterialTheme.typography.labelSmall,
+                    color = if (isMatch) Color(0xFF2E7D32)
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 4.dp)
                 )
 
@@ -1317,6 +1354,26 @@ fun ParagraphEditorDialog(
             }
         }
     }
+}
+
+// ─── Similarity ──────────────────────────────────────────────
+
+private fun computeSimilarity(typed: String, target: String): Float {
+    if (target.isEmpty()) return 0f
+    if (typed.isEmpty()) return 0f
+    val targetWords = target.lowercase().split("\\s+".toRegex())
+    val typedWords = typed.lowercase().split("\\s+".toRegex())
+    if (targetWords.isEmpty()) return 0f
+    var matched = 0
+    val remaining = typedWords.toMutableList()
+    for (word in targetWords) {
+        val idx = remaining.indexOf(word)
+        if (idx >= 0) {
+            matched++
+            remaining.removeAt(idx)
+        }
+    }
+    return (matched.toFloat() / targetWords.size).coerceIn(0f, 1f)
 }
 
 // ─── Theme ───────────────────────────────────────────────────
