@@ -7,31 +7,44 @@ import android.content.ComponentName
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 class AppMonitorService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
+    private val tracker by lazy { AppUsageTracker(this) }
     private var lockRunnable: Runnable? = null
     private var currentMonitoredPackage: String? = null
     private var currentBrowserPackage: String? = null
+    private var monitorStartTime = 0L
+    private var monitorDelay = 0L
     private var lastUrlCheckTime = 0L
     private var lastIncognitoCheckTime = 0L
     private var pendingWebsiteBlock: Runnable? = null
     private var pendingBlockSite: String? = null
+    private var websiteBlockStartTime = 0L
+    private var pendingBlockBrowserPkg: String? = null
     private var isClosingBrowser = false
 
     companion object {
+        private const val TAG = "FocusGuard"
         private const val URL_CHECK_INTERVAL = 1500L
         private const val INCOGNITO_CHECK_INTERVAL = 2000L
         private const val WEBSITE_GRACE_PERIOD = 5_000L
         private const val MAX_TREE_DEPTH = 25
     }
 
-    private val ignoredPackages = setOf(
+    // Transient overlays: notifications, status bar, our own app.
+    // These should NOT cancel a running app-lock timer.
+    private val transientPackages = setOf(
         "com.focusguard.app",
-        "com.android.systemui",
+        "com.android.systemui"
+    )
+
+    // Home screens: the user deliberately left the monitored app.
+    private val launcherPackages = setOf(
         "com.android.launcher",
         "com.android.launcher3",
         "com.google.android.apps.nexuslauncher",
@@ -85,6 +98,21 @@ class AppMonitorService : AccessibilityService() {
 
         if (className.contains("Toast") || className.contains("Popup")) return
 
+        // On every event, check if the monitored app timer has expired.
+        // This is the primary enforcement — does not depend on Handler.
+        if (currentMonitoredPackage != null && monitorStartTime > 0) {
+            val elapsed = System.currentTimeMillis() - monitorStartTime
+            if (elapsed >= monitorDelay) {
+                Log.d(
+                    TAG,
+                    "Event-driven lock for $currentMonitoredPackage " +
+                        "(${elapsed / 1000}s elapsed)"
+                )
+                enforceMonitorLock()
+                return
+            }
+        }
+
         when (eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
                 handleWindowChanged(packageName, className)
@@ -94,6 +122,9 @@ class AppMonitorService : AccessibilityService() {
                 if (currentBrowserPackage != null &&
                     packageName == currentBrowserPackage
                 ) {
+                    // Event-driven website grace period check.
+                    if (checkWebsiteGracePeriodElapsed()) return
+
                     if (hasBlockedWebsites() && throttledIncognitoCheck()) {
                         closeBrowserAndLock(currentBrowserPackage)
                         return
@@ -104,8 +135,21 @@ class AppMonitorService : AccessibilityService() {
         }
     }
 
+    private fun enforceMonitorLock() {
+        lockRunnable?.let { handler.removeCallbacks(it) }
+        lockRunnable = null
+        val pkg = currentMonitoredPackage
+        currentMonitoredPackage = null
+        monitorStartTime = 0L
+        monitorDelay = 0L
+        cancelPendingWebsiteBlock()
+        Log.d(TAG, "Locking screen for $pkg")
+        lockScreenAndGoHome()
+    }
+
     private fun handleWindowChanged(packageName: String, className: String) {
         if (shouldBlockSettingsPage(packageName, className)) {
+            Log.d(TAG, "Blocking settings page: $className")
             lockScreenAndGoHome()
             return
         }
@@ -115,25 +159,36 @@ class AppMonitorService : AccessibilityService() {
             if (!isClosingBrowser &&
                 isIncognitoMode(className) && hasBlockedWebsites()
             ) {
+                Log.d(TAG, "Incognito detected in $packageName")
                 closeBrowserAndLock(packageName)
                 return
             }
             if (checkBrowserUrlAndBlock()) return
-        } else {
+        } else if (packageName !in transientPackages) {
             currentBrowserPackage = null
         }
 
-        if (packageName in ignoredPackages ||
+        // Transient overlays (systemui, our own app): skip entirely,
+        // keep timer and browser tracking alive.
+        if (packageName in transientPackages) {
+            Log.d(TAG, "Transient overlay: $packageName, keeping timer")
+            return
+        }
+
+        // Launcher / home screen: user left the app deliberately.
+        if (packageName in launcherPackages ||
             packageName.contains("launcher", ignoreCase = true)
         ) {
+            Log.d(TAG, "Home screen: $packageName, cancelling timer")
             cancelTimer()
             return
         }
 
-        val tracker = AppUsageTracker(this)
-
         if (!tracker.isMonitored(packageName)) {
-            cancelTimer()
+            // Non-monitored app (keyboard, calculator, etc.):
+            // keep the timer running so opening a monitored app
+            // can't be dodged by briefly switching elsewhere.
+            Log.d(TAG, "Non-monitored app: $packageName, timer continues")
             return
         }
 
@@ -144,10 +199,21 @@ class AppMonitorService : AccessibilityService() {
 
         val openCount = tracker.incrementOpenCount(packageName)
         val delay = getDelayForOpenCount(openCount)
+        monitorStartTime = System.currentTimeMillis()
+        monitorDelay = delay
+        Log.d(
+            TAG,
+            "Monitoring $packageName: open #$openCount, lock in ${delay / 1000}s"
+        )
 
+        // Handler as backup — event-driven check in onAccessibilityEvent
+        // is the primary enforcement in case the OS suppresses the Handler.
         val runnable = Runnable {
-            lockScreenAndGoHome()
+            Log.d(TAG, "Handler fired for $packageName, locking screen")
             currentMonitoredPackage = null
+            monitorStartTime = 0L
+            monitorDelay = 0L
+            lockScreenAndGoHome()
         }
         lockRunnable = runnable
         handler.postDelayed(runnable, delay)
@@ -214,7 +280,7 @@ class AppMonitorService : AccessibilityService() {
     }
 
     private fun hasBlockedWebsites(): Boolean {
-        return AppUsageTracker(this).getMonitoredWebsites().isNotEmpty()
+        return tracker.getMonitoredWebsites().isNotEmpty()
     }
 
     // ─── Website Blocking ────────────────────────────
@@ -226,26 +292,61 @@ class AppMonitorService : AccessibilityService() {
         checkBrowserUrlAndBlock()
     }
 
+    private fun checkWebsiteGracePeriodElapsed(): Boolean {
+        if (pendingBlockSite == null || websiteBlockStartTime == 0L) {
+            return false
+        }
+        val elapsed = System.currentTimeMillis() - websiteBlockStartTime
+        if (elapsed < WEBSITE_GRACE_PERIOD) return false
+
+        val site = pendingBlockSite ?: return false
+        val browserPkg = pendingBlockBrowserPkg
+
+        val currentUrl = extractUrlFromBrowser()
+        if (currentUrl != null && tracker.isMonitoredWebsite(currentUrl)) {
+            Log.d(
+                TAG,
+                "Event-driven website block: $site (${elapsed / 1000}s)"
+            )
+            tracker.incrementWebsiteBlockCount(site)
+            cancelPendingWebsiteBlock()
+            closeBrowserAndLock(browserPkg)
+            return true
+        } else {
+            Log.d(TAG, "User navigated away during grace period")
+            cancelPendingWebsiteBlock()
+        }
+        return false
+    }
+
     private fun checkBrowserUrlAndBlock(): Boolean {
         val url = extractUrlFromBrowser() ?: return false
-        val tracker = AppUsageTracker(this)
         val matchedSite = tracker.findMatchingWebsite(url)
 
         if (matchedSite != null) {
             if (pendingBlockSite == matchedSite) return true
 
+            Log.d(TAG, "Blocked site detected: $matchedSite (url: $url)")
             cancelPendingWebsiteBlock()
             pendingBlockSite = matchedSite
-            val browserPkg = currentBrowserPackage
+            pendingBlockBrowserPkg = currentBrowserPackage
+            websiteBlockStartTime = System.currentTimeMillis()
 
+            // Handler as backup for event-driven check above.
+            val browserPkg = currentBrowserPackage
             val runnable = Runnable {
                 val currentUrl = extractUrlFromBrowser()
                 if (currentUrl != null && tracker.isMonitoredWebsite(currentUrl)) {
+                    Log.d(TAG, "Handler website block: $matchedSite")
                     tracker.incrementWebsiteBlockCount(matchedSite)
                     closeBrowserAndLock(browserPkg)
+                } else {
+                    Log.d(TAG, "User navigated away, cancelling block")
                 }
                 pendingBlockSite = null
                 pendingWebsiteBlock = null
+                websiteBlockStartTime = 0L
+                pendingBlockBrowserPkg = null
             }
             pendingWebsiteBlock = runnable
             handler.postDelayed(runnable, WEBSITE_GRACE_PERIOD)
@@ -262,6 +363,8 @@ class AppMonitorService : AccessibilityService() {
         pendingWebsiteBlock?.let { handler.removeCallbacks(it) }
         pendingWebsiteBlock = null
         pendingBlockSite = null
+        websiteBlockStartTime = 0L
+        pendingBlockBrowserPkg = null
     }
 
     private fun extractUrlFromBrowser(): String? {
@@ -297,7 +400,6 @@ class AppMonitorService : AccessibilityService() {
         packageName: String,
         className: String
     ): Boolean {
-        val tracker = AppUsageTracker(this)
         if (!tracker.isCheatPreventionEnabled()) return false
 
         val isSettings = packageName == "com.android.settings" ||
@@ -316,13 +418,15 @@ class AppMonitorService : AccessibilityService() {
         lockRunnable?.let { handler.removeCallbacks(it) }
         lockRunnable = null
         currentMonitoredPackage = null
+        monitorStartTime = 0L
+        monitorDelay = 0L
         isClosingBrowser = false
         cancelPendingWebsiteBlock()
     }
 
     private fun lockScreenAndGoHome() {
         performGlobalAction(GLOBAL_ACTION_HOME)
-        handler.postDelayed({ lockScreen() }, 300)
+        lockScreen()
     }
 
     /**
@@ -333,28 +437,26 @@ class AppMonitorService : AccessibilityService() {
     private fun closeBrowserAndLock(browserPackage: String?) {
         if (isClosingBrowser) return
         isClosingBrowser = true
+        Log.d(TAG, "closeBrowserAndLock: $browserPackage")
 
         performGlobalAction(GLOBAL_ACTION_BACK)
 
         handler.postDelayed({
             performGlobalAction(GLOBAL_ACTION_HOME)
 
-            handler.postDelayed({
-                if (browserPackage != null) {
-                    try {
-                        val am = getSystemService(
-                            Context.ACTIVITY_SERVICE
-                        ) as ActivityManager
-                        am.killBackgroundProcesses(browserPackage)
-                    } catch (_: Exception) {
-                    }
+            if (browserPackage != null) {
+                try {
+                    val am = getSystemService(
+                        Context.ACTIVITY_SERVICE
+                    ) as ActivityManager
+                    am.killBackgroundProcesses(browserPackage)
+                } catch (_: Exception) {
                 }
-                handler.postDelayed({
-                    lockScreen()
-                    isClosingBrowser = false
-                }, 200)
-            }, 300)
-        }, 200)
+            }
+
+            lockScreen()
+            isClosingBrowser = false
+        }, 300)
     }
 
     private fun lockScreen() {
